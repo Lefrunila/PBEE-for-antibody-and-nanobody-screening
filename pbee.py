@@ -4,6 +4,7 @@
 # Authors: Roberto D. Lins, Elton J. F. Chaves, and João Sartori
 # Adapted: multi-chain partners + verbose status, no input deletions
 # Added: --rebuild_missing toggle (PDBFixer/OpenMM) + rebuild step before Rosetta
+# HTS: multiple inputs (.pdb, .zip, directories) + global ranked CSV
 # ===================================================================================
 
 import warnings
@@ -18,8 +19,9 @@ from shutil import which
 from pyrosetta import *
 import pandas as pd
 import numpy as np
-import os, sys, math, time, glob, shutil, argparse, subprocess
+import os, sys, math, time, glob, shutil, argparse, subprocess, zipfile
 from itertools import product
+from datetime import datetime
 
 # --- optional rebuild deps (PDBFixer/OpenMM) ---
 try:
@@ -290,7 +292,7 @@ def predictor(trainedmodels, mlengine, mlmodel, x, y, rosetta_features, columns_
 
 # ------------------------------ Pre/Post stages -----------------------------------
 
-def pre_processing(pdbfiles, partner1, partner2, on_missing_chains):
+def pre_processing(pdbfiles, partner1, partner2, on_missing_chains, strict_chains):
     bad_structures = []
     resolved_partners = {}  # map pdb -> (p1_used, p2_used)
 
@@ -309,6 +311,11 @@ def pre_processing(pdbfiles, partner1, partner2, on_missing_chains):
         ok, chains, present1, present2 = partner_checker(pdb, partner1, partner2)
         print_infos(message=f'[{mol}] detected chains: {chains}', type='info')
         if not ok:
+            if strict_chains:
+                print_infos(message=f'[{mol}] missing requested partner chains; skipping (strict_chains=True).', type='info')
+                bad_structures.append(pdb)
+                shutil.rmtree(outdir, ignore_errors=True)
+                continue
             choice = choose_on_missing(on_missing_chains, chains)
             if choice is None:
                 print_infos(message=f'[{mol}] argument error (--partner1/--partner2): chain ID not found ({set(partner_letters(partner1)) | set(partner_letters(partner2))})', type='info')
@@ -362,7 +369,6 @@ def maybe_rebuild_structure(pdb_path, outdir, basename):
     try:
         print_infos(message='Rebuilding missing residues/atoms with PDBFixer', type='protocol')
         fixer = PDBFixer(filename=pdb_path)
-
         fixer.findMissingResidues()
         fixer.findMissingAtoms()
         fixer.addMissingAtoms()
@@ -380,11 +386,15 @@ def maybe_rebuild_structure(pdb_path, outdir, basename):
         return pdb_path
 
 def post_processing(pdbfiles, resolved_partners, trainedmodels, mlmodel, st):
+    summary_rows = []
     for mol, pdb in enumerate(pdbfiles):
         basename = os.path.basename(pdb[:-4])
         outdir = f'{args.odir[0]}/pbee_outputs/{basename}'
 
-        p1_use, p2_use = resolved_partners[pdb]
+        p1_use, p2_use = resolved_partners.get(pdb, (None, None))
+        if p1_use is None:
+            # was skipped in pre
+            continue
 
         print_infos(message=f'[{mol}] {pdb}', type='protocol')
         partners = [
@@ -408,7 +418,7 @@ def post_processing(pdbfiles, resolved_partners, trainedmodels, mlmodel, st):
             with open(_pdb, 'w') as f:
                 f.writelines(lines)
 
-        # ---- NEW: try to rebuild before Rosetta
+        # Rebuild before Rosetta if requested
         _pdb = maybe_rebuild_structure(_pdb, outdir, basename)
 
         _pdb = scorejd2(_pdb, basename, outdir)
@@ -458,12 +468,85 @@ def post_processing(pdbfiles, resolved_partners, trainedmodels, mlmodel, st):
         rosetta_features.insert(5, 'processing_time', total_time)
         rosetta_features.to_csv(f'{outdir}/dG_pred.csv', index=False)
 
+        # accumulate to summary
+        summary_rows.append({
+            "pdb": basename,
+            "dG_pred": dG_pred,
+            "KD_M": affinity,
+            "mlengine": mlengine,
+            "total_atoms": total_atoms,
+            "processing_time": total_time
+        })
+
         # remove only temporary JD2 files
         remove_files(files=[
             glob.glob(f'{outdir}/*fasta'),
             f'{outdir}/{basename}_jd2_01.pdb',
             f'{outdir}/{basename}_jd2_02.pdb'
         ])
+
+    return summary_rows
+
+# ------------------------------ Input expansion (HTS) -----------------------------
+
+def collect_pdbs_from_dir(root):
+    pdbs = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.lower().endswith(".pdb"):
+                full = os.path.join(dirpath, fn)
+                if ispdb(full):
+                    pdbs.append(os.path.abspath(full))
+    return pdbs
+
+def expand_inputs(inputs, odir):
+    """
+    Accepts files (.pdb or .zip) and/or directories.
+    - If .zip is provided, extracts to odir/hts_inputs_<ts>/zip_<i> and collects .pdb files only.
+    - If directory, collects .pdb recursively.
+    - If .pdb, adds directly.
+    Returns: list of absolute paths to valid PDB files.
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    hts_root = os.path.join(odir, f"hts_inputs_{ts}")
+    os.makedirs(hts_root, exist_ok=True)
+
+    all_pdbs = []
+
+    for i, item in enumerate(inputs):
+        item = os.path.abspath(item)
+        if os.path.isdir(item):
+            # directory of pdbs
+            pdbs = collect_pdbs_from_dir(item)
+            print_infos(message=f'found {len(pdbs)} PDB(s) in dir -> {item}', type='info')
+            all_pdbs.extend(pdbs)
+        elif item.lower().endswith(".zip"):
+            # extract zip
+            dest = os.path.join(hts_root, f"zip_{i}")
+            os.makedirs(dest, exist_ok=True)
+            try:
+                with zipfile.ZipFile(item, 'r') as zf:
+                    zf.extractall(dest)
+                pdbs = collect_pdbs_from_dir(dest)
+                print_infos(message=f'extracted {len(pdbs)} PDB(s) from zip -> {item}', type='info')
+                all_pdbs.extend(pdbs)
+            except zipfile.BadZipFile:
+                print_infos(message=f'bad zip file (skipped) -> {item}', type='info')
+        elif item.lower().endswith(".pdb"):
+            if ispdb(item):
+                all_pdbs.append(item)
+            else:
+                print_infos(message=f'non-PDB or empty ATOM records (skipped) -> {item}', type='info')
+        else:
+            print_infos(message=f'unsupported input (skipped) -> {item}', type='info')
+
+    # Deduplicate while preserving order
+    seen = set()
+    ordered = []
+    for p in all_pdbs:
+        if p not in seen:
+            seen.add(p); ordered.append(p)
+    return ordered
 
 # ----------------------------------- main -----------------------------------------
 
@@ -492,8 +575,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(add_help=True)
     mandatory = parser.add_argument_group('mandatory arguments')
-    mandatory.add_argument('--ipdb', nargs='+', type=str, required=True, metavar='',
-                           help='str | input file(s) in the PDB format (supports globs)')
+    # Backward compatible flag (still supported)
+    mandatory.add_argument('--ipdb', nargs='*', type=str, metavar='',
+                           help='[deprecated] input file(s) in PDB format (supports globs). Prefer --inputs.')
+    # New unified inputs: file(s)/dir(s)/zip(s)
+    mandatory.add_argument('--inputs', nargs='*', type=str, metavar='',
+                           help='path(s) to .pdb, .zip, or directory containing PDBs (recursive).')
+
     mandatory.add_argument('--partner1', nargs=1, type=str, required=True, metavar='',
                            help='str | chain ID(s) for partner1 (e.g., H or HL)')
     mandatory.add_argument('--partner2', nargs=1, type=str, required=True, metavar='',
@@ -513,12 +601,13 @@ if __name__ == "__main__":
                         help='what to do if requested partner chains are not found')
     parser.add_argument('--list_models', action='store_true', help='list available ML models and exit if no inputs')
 
-    # ---- NEW FLAG
+    # NEW FLAGS
     parser.add_argument('--rebuild_missing', action='store_true',
                         help='Rebuild missing residues/atoms with PDBFixer/OpenMM before Rosetta (requires openmm & pdbfixer).')
+    parser.add_argument('--strict_chains', action='store_true',
+                        help='Require both partner1 and partner2 chains to be present; otherwise skip. Recommended for HTS.')
 
     args            = parser.parse_args()
-    pdbfiles_raw    = args.ipdb
     partner1        = args.partner1[0].upper().strip()
     partner2        = args.partner2[0].upper().strip()
     odir            = args.odir[0]
@@ -528,17 +617,29 @@ if __name__ == "__main__":
     frcmod_struct   = args.frcmod_struct
     frcmod_scores   = args.frcmod_scores
     on_missing_chains = args.on_missing_chains[0]
+    strict_chains   = args.strict_chains
 
-    # Expand globs safely
-    expanded = []
-    for pat in pdbfiles_raw:
+    # Resolve inputs (new --inputs preferred; fallback to --ipdb)
+    input_args = []
+    if args.inputs: input_args.extend(args.inputs)
+    if args.ipdb:   input_args.extend(args.ipdb)
+
+    if len(input_args) == 0:
+        print_infos(message='no inputs provided. Use --inputs with .pdb/.zip/dir, or --ipdb.', type='info'); print_end()
+
+    # Expand globs and normalize file/dir paths
+    expanded_args = []
+    for pat in input_args:
         if any(ch in pat for ch in ['*','?','[']):
-            expanded.extend(glob.glob(pat))
+            expanded_args.extend(glob.glob(pat))
         else:
-            expanded.append(pat)
-    pdbfiles = [p for p in expanded if ispdb(p)]
+            expanded_args.append(pat)
+
+    # Build final pdb list from all supported inputs
+    inputs_expanded = expand_inputs(expanded_args, odir)
+    pdbfiles = [p for p in inputs_expanded if ispdb(p)]
     if len(pdbfiles) == 0:
-        print_infos(message=f'no valid PDB files matched: {pdbfiles_raw}', type='info'); print_end()
+        print_infos(message=f'no valid PDB files found from inputs: {expanded_args}', type='info'); print_end()
 
     # Show chosen config
     print(f'        mlengine: {mlmodel}')
@@ -549,6 +650,7 @@ if __name__ == "__main__":
     if frcmod_struct: print(f'   frcmod_struct: {frcmod_struct}')
     if frcmod_scores: print(f'   frcmod_scores: {frcmod_scores}')
     if args.rebuild_missing: print(f'  rebuild_missing: {args.rebuild_missing}')
+    if strict_chains: print(f'    strict_chains: {strict_chains}')
     print('')
 
     if args.list_models:
@@ -559,16 +661,41 @@ if __name__ == "__main__":
 
     # Enumerate to user
     print_infos(message=f'will process {len(pdbfiles)} file(s):', type='info')
-    for i, p in enumerate(pdbfiles):
+    for i, p in enumerate(pdbfiles[:50]):  # avoid flooding
         print_infos(message=f'  [{i}] {p}', type='info')
+    if len(pdbfiles) > 50:
+        print_infos(message=f'  ... and {len(pdbfiles)-50} more', type='info')
 
     # Pre
-    bad_structures, resolved = pre_processing(pdbfiles, partner1, partner2, on_missing_chains)
+    bad_structures, resolved = pre_processing(pdbfiles, partner1, partner2, on_missing_chains, strict_chains)
     worklist = [p for p in pdbfiles if p not in bad_structures]
 
     print_infos(message=f'total structures: {len(worklist)}', type='info')
     if len(worklist) != 0:
-        post_processing(worklist, resolved, trainedmodels, mlmodel, st)
+        summary_rows = post_processing(worklist, resolved, trainedmodels, mlmodel, st)
+
+        # Write global ranked CSV
+        summary_dir = os.path.join(odir, "pbee_outputs", "_summary")
+        os.makedirs(summary_dir, exist_ok=True)
+        summary_path = os.path.join(summary_dir, "pbee_ranked.csv")
+
+        if len(summary_rows) == 0:
+            print_infos(message='no successful predictions to summarize.', type='info')
+        else:
+            df = pd.DataFrame(summary_rows)
+            # rank best (most negative ΔG) on top
+            df = df.sort_values(by="dG_pred", ascending=True)
+            df.to_csv(summary_path, index=False)
+            print_infos(message=f'Wrote ranked summary CSV -> {summary_path}', type='protocol')
+
+            # Print CSV contents (full)
+            try:
+                # Avoid scientific notation for KD when printing
+                with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.float_format", "{:,.6f}".format):
+                    print(df.to_string(index=False))
+            except Exception as e:
+                print_infos(message=f'could not print summary table: {e}', type='info')
+
         elapsed_time = processing_time(st)
         print(' processing time:', time.strftime("%H:%M:%S", time.gmtime(elapsed_time)))
         print_end()
