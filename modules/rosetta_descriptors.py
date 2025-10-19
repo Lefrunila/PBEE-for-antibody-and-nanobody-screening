@@ -190,7 +190,13 @@ def Get_descriptors(pdb, ions, outdir, basename, partner1, partner2):
     # Create the beta_nov16 score function
     scorefxn = rosetta.core.scoring.ScoreFunctionFactory.create_score_function("beta_nov16")
     scorefxn(pose)
-
+    all_old_chains = list(partner1) + list(partner2)
+    chains_in_pose = [pose.pdb_info().chain(i) for i in range(1, pose.size() + 1)]
+    chains_in_pose = list(dict.fromkeys(chains_in_pose))
+    # Create a mapping from inputed partners chains to jd2 chains
+    chain_map = {old_chain: new_chain for old_chain, new_chain in zip(all_old_chains, chains_in_pose)}
+    partner1 = "".join([chain_map[chain] for chain in partner1])
+    partner2 = "".join([chain_map[chain] for chain in partner2])
     minimize(pose=pose, scorefxn=scorefxn, minimizer_type="minmover1")
     minimize(pose=pose, scorefxn=scorefxn, minimizer_type="minmover2")
     scorefxn(pose)
@@ -213,3 +219,6 @@ def Get_descriptors(pdb, ions, outdir, basename, partner1, partner2):
     sys.stderr = sys.__stderr__
     
     return pose, all_terms_df
+
+
+
