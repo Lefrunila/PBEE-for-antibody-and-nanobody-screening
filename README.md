@@ -1,7 +1,7 @@
 ![logo](https://github.com/chavesejf/pbee/blob/main/figures/toc_page-0001.jpg)
 
 ## Overview
-PBEE (**P**rotein **B**inding **E**nergy **E**stimator) is an easy-to-use pipeline written in Python3 that use a ML model based on Rosetta descriptors to predict the free energy of binding of protein-protein complexes. More details on PBEE training and validation can be found in our [publication](https://pubs.acs.org/doi/10.1021/acs.jcim.4c01641).
+This is a fork of PBEE (**P**rotein **B**inding **E**nergy **E**stimator) is an easy-to-use pipeline written in Python3 that use a ML model based on Rosetta descriptors to predict the free energy of binding of protein-protein complexes. It's porpouse is to easily screen hundreds or thousands antibdody and/or nanobody predicted sequences  More details on PBEE training and validation can be found in their [publication](https://pubs.acs.org/doi/10.1021/acs.jcim.4c01641).
 
 ## Requirements
 
@@ -15,7 +15,7 @@ PBEE (**P**rotein **B**inding **E**nergy **E**stimator) is an easy-to-use pipeli
 | pandas         | 2.0.3   |
 
 ## Google Colab
-Before install and run it locally, you can try the online version of PBEE in [Google Colab Notebook](https://colab.research.google.com/drive/1lu1dC0yRltKK_Wp-gF26oHcZSCiHaI8b).
+Before install and run it locally, you can try the online version of PBEE in [Google Colab Notebook]([https://colab.research.google.com/drive/1lu1dC0yRltKK_Wp-gF26oHcZSCiHaI8b](https://colab.research.google.com/drive/1iPlH4czB5eGrv3bKMV6I6YJmya5QX4c_?usp=sharing)).
 
 ## Download & Install
 #### Step 1 - Install Conda (if not already installed)
